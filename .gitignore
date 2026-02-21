@@ -1,0 +1,17 @@
+musicwidget_bin
+musicwidget
+
+pkg/
+src/
+*.pkg.tar.zst
+*.pkg.tar.xz
+
+*.o
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+.DS_Store
