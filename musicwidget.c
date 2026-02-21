@@ -16,7 +16,7 @@
  *     /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml \
  *     xdg-shell-client-protocol.c
  *
- *   gcc -o musicwidget_bin musicwidget.c \
+ *   gcc -o musicwidget musicwidget.c \
  *     wlr-layer-shell-unstable-v1-client-protocol.c \
  *     xdg-shell-client-protocol.c \
  *     $(pkg-config --cflags --libs wayland-client cairo) \
@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <stdint.h>
@@ -48,7 +49,7 @@
 #define ART_SIZE     72
 #define ART_RADIUS   10.0
 #define CARD_RADIUS  18.0
-#define POLL_SECS    1
+#define POLL_MS      100   /* poll playerctl every 100ms */
 
 #define BTN_CX  (WIDTH  - MARGIN - 14)
 #define BTN_CY  (MARGIN + 14)
@@ -105,7 +106,7 @@ static PlayerState state;
 
 /* ── Helpers ─────────────────────────────────────────────────────────── */
 
-static char *playerctl(const char *args)
+static char *run_playerctl(const char *args)
 {
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
@@ -124,19 +125,19 @@ static char *playerctl(const char *args)
 static void poll_state(void)
 {
     char *v;
-    v = playerctl("metadata title");
+    v = run_playerctl("metadata title");
     strncpy(state.title,   v, 255); free(v);
-    v = playerctl("metadata artist");
+    v = run_playerctl("metadata artist");
     strncpy(state.artist,  v, 255); free(v);
-    v = playerctl("metadata album");
+    v = run_playerctl("metadata album");
     strncpy(state.album,   v, 255); free(v);
-    v = playerctl("metadata mpris:artUrl");
+    v = run_playerctl("metadata mpris:artUrl");
     strncpy(state.art_url, v, 511); free(v);
-    v = playerctl("position");
+    v = run_playerctl("position");
     state.position = atof(v); free(v);
-    v = playerctl("metadata mpris:length");
+    v = run_playerctl("metadata mpris:length");
     state.length = atof(v) / 1000000.0; free(v);
-    v = playerctl("status");
+    v = run_playerctl("status");
     state.playing = (strcmp(v, "Playing") == 0); free(v);
 }
 
@@ -258,12 +259,12 @@ static void draw_art(cairo_t *cr,
     for (int row = 0; row < th; row++) {
         uint32_t *px = (uint32_t *)(data + row * stride);
         for (int col = 0; col < tw; col++) {
-            uint32_t p  = px[col];
-            uint8_t  a  = (p >> 24) & 0xff;
-            uint8_t  r  = (p >> 16) & 0xff;
-            uint8_t  g  = (p >>  8) & 0xff;
-            uint8_t  b  = (p      ) & 0xff;
-            uint8_t grey = (uint8_t)(0.299*r + 0.587*g + 0.114*b);
+            uint32_t p    = px[col];
+            uint8_t  a    = (p >> 24) & 0xff;
+            uint8_t  r    = (p >> 16) & 0xff;
+            uint8_t  g    = (p >>  8) & 0xff;
+            uint8_t  b    = (p      ) & 0xff;
+            uint8_t  grey = (uint8_t)(0.299*r + 0.587*g + 0.114*b);
             px[col] = ((uint32_t)a    << 24) |
                       ((uint32_t)grey << 16) |
                       ((uint32_t)grey <<  8) |
@@ -388,6 +389,7 @@ static void redraw(void)
 static double   ptr_x            = 0, ptr_y = 0;
 static uint32_t ptr_enter_serial = 0;
 static uint32_t last_click_time  = 0;
+static int      suppress_poll    = 0;
 
 static int over_button(void)
 {
@@ -442,6 +444,10 @@ static void pointer_button(void *data, struct wl_pointer *ptr,
     redraw();
     wl_display_flush(display);
     system("playerctl --player=kew play-pause");
+
+    /* Suppress the next few polls so playerctl has time to
+     * actually act before we ask it what it's doing. */
+    suppress_poll = 3;
 }
 
 static void pointer_axis(void *data, struct wl_pointer *ptr,
@@ -622,21 +628,51 @@ int main(void)
     poll_state();
     redraw();
 
-    time_t last_poll = time(NULL);
+    /*
+     * Main loop — use poll() on the Wayland fd so we block
+     * efficiently waiting for compositor events, but wake up
+     * at least every POLL_MS to refresh playerctl state.
+     *
+     * This keeps the button responsive AND the display current
+     * without busy-looping like an absolute maniac.
+     */
+    int wl_fd = wl_display_get_fd(display);
+    struct timespec last_poll_ts;
+    clock_gettime(CLOCK_MONOTONIC, &last_poll_ts);
 
     while (running) {
-        wl_display_dispatch(display);
-        wl_display_flush(display);
+        /* Flush any pending outgoing requests. */
+        if (wl_display_flush(display) < 0) break;
 
-        time_t now = time(NULL);
-        if (now - last_poll >= POLL_SECS) {
-            last_poll = now;
-            poll_state();
-            redraw();
+        /* Work out how long until the next playerctl poll. */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed_ms = (now.tv_sec  - last_poll_ts.tv_sec)  * 1000
+                        + (now.tv_nsec - last_poll_ts.tv_nsec) / 1000000;
+        int timeout = (int)(POLL_MS - elapsed_ms);
+        if (timeout < 0) timeout = 0;
+
+        /* Block on the Wayland fd until an event arrives or
+         * the poll timer fires — whichever comes first. */
+        struct pollfd pfd = { .fd = wl_fd, .events = POLLIN };
+        poll(&pfd, 1, timeout);
+
+        /* Dispatch whatever Wayland events are waiting. */
+        if (wl_display_dispatch(display) < 0) break;
+
+        /* Poll playerctl on schedule. */
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        elapsed_ms = (now.tv_sec  - last_poll_ts.tv_sec)  * 1000
+                   + (now.tv_nsec - last_poll_ts.tv_nsec) / 1000000;
+        if (elapsed_ms >= POLL_MS) {
+            last_poll_ts = now;
+            if (suppress_poll > 0) {
+                suppress_poll--;
+            } else {
+                poll_state();
+                redraw();
+            }
         }
-
-        struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 };
-        nanosleep(&ts, NULL);
     }
 
     wl_cursor_theme_destroy(cursor_theme);
